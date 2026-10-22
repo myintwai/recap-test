@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       urls:
-        description: "Video links, one per line (TikTok / Douyin / Xiaohongshu / iQIYI / YouTube ...)"
+        description: "Links or whole share-text, one per line (TikTok / Douyin / Xiaohongshu / RedNote / iQIYI / YouTube)"
         required: true
         type: string
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Install ffmpeg + yt-dlp
         run: |
@@ -27,46 +27,88 @@ jobs:
           COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
           DOUYIN_COOKIES: ${{ secrets.DOUYIN_COOKIES }}
           IQIYI_COOKIES: ${{ secrets.IQIYI_COOKIES }}
+          XHS_COOKIES: ${{ secrets.XHS_COOKIES }}
         run: |
           mkdir -p t
           [ -n "$COOKIES_TXT" ]    && printf '%s\n' "$COOKIES_TXT"    > cookies.txt
           [ -n "$DOUYIN_COOKIES" ] && printf '%s\n' "$DOUYIN_COOKIES" > douyin.txt
           [ -n "$IQIYI_COOKIES" ]  && printf '%s\n' "$IQIYI_COOKIES"  > iqiyi.txt
+          [ -n "$XHS_COOKIES" ]    && printf '%s\n' "$XHS_COOKIES"    > xhs.txt
+
+          UA="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
           echo "## yt-dlp test on GitHub runner" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
 
           i=0
           printf '%s\n' "$URLS" | while IFS= read -r line; do
-            url=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            [ -z "$url" ] && continue
+            line=$(printf '%s' "$line" | tr -d '\r')
+            [ -z "$(printf '%s' "$line" | tr -d '[:space:]')" ] && continue
             i=$((i+1))
 
-            cf=""
+            # pull the first supported link out of the pasted share text
+            url=$(printf '%s' "$line" | grep -oEi "https?://[A-Za-z0-9.-]*(youtube\.com|youtu\.be|tiktok\.com|xiaohongshu\.com|rednote\.com|xhslink\.com|douyin\.com|iesdouyin\.com|iqiyi\.com|iq\.com|qy\.net)[A-Za-z0-9._~:/?#@!$&'()*+;=%-]*" | head -1)
+            url=$(printf '%s' "$url" | sed -E 's/[.,;:!?)]+$//')
+            if [ -z "$url" ]; then
+              echo "- [$i] FAIL - no supported link found in this line" | tee -a "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            cf=(); extra=(); site="other"
             case "$url" in
-              *douyin*) [ -f douyin.txt ]  && cf="--cookies douyin.txt" ;;
-              *iqiyi*)  [ -f iqiyi.txt ]   && cf="--cookies iqiyi.txt" ;;
-              *)        [ -f cookies.txt ] && cf="--cookies cookies.txt" ;;
+              *rednote.com*|*xiaohongshu.com*|*xhslink.com*)
+                site="xhs"
+                url=$(printf '%s' "$url" | sed -E 's#https?://([A-Za-z0-9-]+\.)*rednote\.com#https://www.xiaohongshu.com#I')
+                if printf '%s' "$url" | grep -qi "xhslink.com"; then
+                  fol=$(curl -sL -o /dev/null -w '%{url_effective}' --max-time 20 -A "$UA" "$url")
+                  if printf '%s' "$fol" | grep -qiE "xiaohongshu\.com|rednote\.com"; then
+                    url=$(printf '%s' "$fol" | sed -E 's#https?://([A-Za-z0-9-]+\.)*rednote\.com#https://www.xiaohongshu.com#I')
+                  fi
+                fi
+                extra=(--impersonate chrome --add-header "Referer:https://www.xiaohongshu.com/" --add-header "Accept-Language:zh-CN,zh;q=0.9,en;q=0.8")
+                [ -f xhs.txt ] && cf=(--cookies xhs.txt)
+                ;;
+              *douyin.com*|*iesdouyin.com*)
+                site="douyin"
+                if printf '%s' "$url" | grep -qi "v.douyin.com"; then
+                  fol=$(curl -sL -o /dev/null -w '%{url_effective}' --max-time 20 -A "$UA" "$url")
+                  printf '%s' "$fol" | grep -qiE "douyin\.com|iesdouyin\.com" && url="$fol"
+                fi
+                extra=(--impersonate chrome)
+                [ -f douyin.txt ] && cf=(--cookies douyin.txt)
+                ;;
+              *iqiyi.com*|*iq.com*|*qy.net*)
+                site="iqiyi"
+                extra=(--impersonate chrome)
+                [ -f iqiyi.txt ] && cf=(--cookies iqiyi.txt)
+                ;;
+              *)
+                [ -f cookies.txt ] && cf=(--cookies cookies.txt)
+                ;;
             esac
 
             mkdir -p "t/$i"
-            echo "=== [$i] $url (cookies: ${cf:-none}) ==="
-            if yt-dlp $cf --impersonate chrome --no-playlist \
-                 -f "b[height<=480]/b" \
-                 --download-sections "*0-20" \
-                 -o "t/$i/clip.%(ext)s" "$url" > "t/$i.log" 2>&1; then
+            echo "=== [$i] ($site) $url (cookies: ${cf[*]:-none}) ==="
+
+            # try 1: only the first 20 seconds
+            yt-dlp "${cf[@]}" "${extra[@]}" --no-playlist -f "b[height<=480]/b/best" \
+              --download-sections "*0-20" -o "t/$i/clip.%(ext)s" "$url" > "t/$i.log" 2>&1
+            f=$(ls t/$i/clip.* 2>/dev/null | head -1)
+            # try 2: normal download, capped at 80 MB
+            if [ -z "$f" ] || [ ! -s "$f" ]; then
+              echo "--- retry without section cut ---" >> "t/$i.log"
+              yt-dlp "${cf[@]}" "${extra[@]}" --no-playlist -f "b[height<=480]/b/best" \
+                --max-filesize 80M -o "t/$i/clip.%(ext)s" "$url" >> "t/$i.log" 2>&1
               f=$(ls t/$i/clip.* 2>/dev/null | head -1)
-              if [ -n "$f" ] && [ -s "$f" ]; then
-                size=$(du -h "$f" | cut -f1)
-                dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)
-                echo "- [$i] OK   - $size, ${dur}s - $url" | tee -a "$GITHUB_STEP_SUMMARY"
-              else
-                echo "- [$i] FAIL - no file produced - $url" | tee -a "$GITHUB_STEP_SUMMARY"
-                tail -3 "t/$i.log" | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
-              fi
+            fi
+
+            if [ -n "$f" ] && [ -s "$f" ]; then
+              size=$(du -h "$f" | cut -f1)
+              dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)
+              echo "- [$i] OK ($site) - $size, ${dur}s" | tee -a "$GITHUB_STEP_SUMMARY"
             else
-              echo "- [$i] FAIL - $url" | tee -a "$GITHUB_STEP_SUMMARY"
-              tail -3 "t/$i.log" | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
+              echo "- [$i] FAIL ($site) - $url" | tee -a "$GITHUB_STEP_SUMMARY"
+              grep -E "ERROR|WARNING" "t/$i.log" | tail -3 | cut -c1-300 | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
             fi
             echo "--- full log [$i] ---"
             cat "t/$i.log"
