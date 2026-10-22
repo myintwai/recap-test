@@ -1,3 +1,5 @@
+name: ytdlp-test
+
 on:
   workflow_dispatch:
     inputs:
@@ -69,4 +71,3 @@ jobs:
             echo "--- full log [$i] ---"
             cat "t/$i.log"
           done
-
