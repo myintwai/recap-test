@@ -11,7 +11,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Install ffmpeg + yt-dlp
         run: |
@@ -19,6 +19,7 @@ jobs:
           sudo apt-get install -y -qq ffmpeg
           pip install -U "yt-dlp[default,curl-cffi]"
           yt-dlp --version
+          node --version
           ffmpeg -version | head -1
 
       - name: Test downloads (first 20s of each link)
@@ -35,7 +36,22 @@ jobs:
           [ -n "$IQIYI_COOKIES" ]  && printf '%s\n' "$IQIYI_COOKIES"  > iqiyi.txt
           [ -n "$XHS_COOKIES" ]    && printf '%s\n' "$XHS_COOKIES"    > xhs.txt
 
-          UA="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+          MOBILE_UA="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+          DESKTOP_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          FMT="b[height<=480]/b/best"
+
+          cat > extract_dy.py <<'PYEOF'
+          import re, sys
+          h = open(sys.argv[1], encoding="utf-8", errors="ignore").read()
+          found = []
+          def unesc(u):
+              u = u.replace("\\/", "/").replace("&amp;", "&")
+              return re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), u)
+          for p in (r'"play_addr"\s*:\s*\{[^}]*?"url_list"\s*:\s*\[\s*"([^"]+)"', r'"playAddr"\s*:\s*"([^"]+)"', r'<meta[^>]+property="og:video"[^>]+content="([^"]+)"'):
+              for m in re.findall(p, h):
+                  found.append(unesc(m))
+          print(found[0] if found else "")
+          PYEOF
 
           echo "## yt-dlp test on GitHub runner" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -46,7 +62,6 @@ jobs:
             [ -z "$(printf '%s' "$line" | tr -d '[:space:]')" ] && continue
             i=$((i+1))
 
-            # pull the first supported link out of the pasted share text
             url=$(printf '%s' "$line" | grep -oEi "https?://[A-Za-z0-9.-]*(youtube\.com|youtu\.be|tiktok\.com|xiaohongshu\.com|rednote\.com|xhslink\.com|douyin\.com|iesdouyin\.com|iqiyi\.com|iq\.com|qy\.net)[A-Za-z0-9._~:/?#@!$&'()*+;=%-]*" | head -1)
             url=$(printf '%s' "$url" | sed -E 's/[.,;:!?)]+$//')
             if [ -z "$url" ]; then
@@ -54,62 +69,91 @@ jobs:
               continue
             fi
 
-            cf=(); extra=(); site="other"
+            mkdir -p "t/$i"
+            LOG="t/$i.log"; : > "$LOG"
+
+            # one download attempt; returns 0 if a non-empty clip was produced
+            attempt() {
+              echo "--- attempt: $* ---" >> "$LOG"
+              rm -f t/$i/clip.*
+              yt-dlp "$@" --no-playlist -f "$FMT" --download-sections "*0-20" \
+                -o "t/$i/clip.%(ext)s" "$url" >> "$LOG" 2>&1
+              f=$(ls t/$i/clip.* 2>/dev/null | head -1)
+              [ -n "$f" ] && [ -s "$f" ]
+            }
+
+            site="other"; ok=1
             case "$url" in
               *rednote.com*|*xiaohongshu.com*|*xhslink.com*)
                 site="xhs"
                 url=$(printf '%s' "$url" | sed -E 's#https?://([A-Za-z0-9-]+\.)*rednote\.com#https://www.xiaohongshu.com#I')
                 if printf '%s' "$url" | grep -qi "xhslink.com"; then
-                  fol=$(curl -sL -o /dev/null -w '%{url_effective}' --max-time 20 -A "$UA" "$url")
-                  if printf '%s' "$fol" | grep -qiE "xiaohongshu\.com|rednote\.com"; then
-                    url=$(printf '%s' "$fol" | sed -E 's#https?://([A-Za-z0-9-]+\.)*rednote\.com#https://www.xiaohongshu.com#I')
-                  fi
+                  fol=$(curl -sL -o /dev/null -w '%{url_effective}' --max-time 20 -A "$MOBILE_UA" "$url")
+                  printf '%s' "$fol" | grep -qiE "xiaohongshu\.com|rednote\.com" && url=$(printf '%s' "$fol" | sed -E 's#https?://([A-Za-z0-9-]+\.)*rednote\.com#https://www.xiaohongshu.com#I')
                 fi
-                extra=(--impersonate chrome --add-header "Referer:https://www.xiaohongshu.com/" --add-header "Accept-Language:zh-CN,zh;q=0.9,en;q=0.8")
-                [ -f xhs.txt ] && cf=(--cookies xhs.txt)
+                H=(--add-header "Referer:https://www.xiaohongshu.com/" --add-header "Accept-Language:zh-CN,zh;q=0.9,en;q=0.8")
+                C=(); [ -f xhs.txt ] && C=(--cookies xhs.txt)
+                attempt --impersonate chrome "${C[@]}" "${H[@]}" && ok=0
+                [ $ok -ne 0 ] && attempt --user-agent "$DESKTOP_UA" "${C[@]}" "${H[@]}" && ok=0
                 ;;
               *douyin.com*|*iesdouyin.com*)
                 site="douyin"
                 if printf '%s' "$url" | grep -qi "v.douyin.com"; then
-                  fol=$(curl -sL -o /dev/null -w '%{url_effective}' --max-time 20 -A "$UA" "$url")
+                  fol=$(curl -sL -o /dev/null -w '%{url_effective}' --max-time 20 -A "$MOBILE_UA" "$url")
                   printf '%s' "$fol" | grep -qiE "douyin\.com|iesdouyin\.com" && url="$fol"
                 fi
-                extra=(--impersonate chrome)
-                [ -f douyin.txt ] && cf=(--cookies douyin.txt)
+                C=(); [ -f douyin.txt ] && C=(--cookies douyin.txt)
+                attempt --impersonate chrome "${C[@]}" && ok=0
+                [ $ok -ne 0 ] && attempt --user-agent "$MOBILE_UA" "${C[@]}" && ok=0
+                [ $ok -ne 0 ] && attempt --user-agent "$DESKTOP_UA" "${C[@]}" && ok=0
+                if [ $ok -ne 0 ]; then
+                  echo "--- attempt: parse page HTML for video url ---" >> "$LOG"
+                  CK=(); [ -f douyin.txt ] && CK=(-b douyin.txt)
+                  curl -sL --max-time 25 -A "$MOBILE_UA" "${CK[@]}" -H "Referer: https://www.douyin.com/" "$url" -o t/$i/page.html
+                  vid=$(python3 extract_dy.py t/$i/page.html)
+                  if [ -n "$vid" ]; then
+                    echo "found video url in page html" >> "$LOG"
+                    curl -sL --max-time 120 -r 0-3000000 -A "$MOBILE_UA" -H "Referer: https://www.douyin.com/" "$vid" -o t/$i/clip.mp4
+                    [ -s t/$i/clip.mp4 ] && ok=0
+                  else
+                    echo "ERROR: no video url found in page html (login wall / blocked / removed)" >> "$LOG"
+                  fi
+                fi
                 ;;
               *iqiyi.com*|*iq.com*|*qy.net*)
                 site="iqiyi"
-                extra=(--impersonate chrome)
-                [ -f iqiyi.txt ] && cf=(--cookies iqiyi.txt)
+                C=(); [ -f iqiyi.txt ] && C=(--cookies iqiyi.txt)
+                attempt --impersonate chrome "${C[@]}" && ok=0
+                ;;
+              *youtube.com*|*youtu.be*)
+                site="youtube"
+                YT=(--js-runtimes node --remote-components ejs:github)
+                C=(); [ -f cookies.txt ] && C=(--cookies cookies.txt)
+                if [ -f cookies.txt ]; then
+                  attempt "${YT[@]}" "${C[@]}" --extractor-args "youtube:player_client=web" && ok=0
+                fi
+                [ $ok -ne 0 ] && attempt "${YT[@]}" --extractor-args "youtube:player_client=web" && ok=0
+                [ $ok -ne 0 ] && attempt "${YT[@]}" --extractor-args "youtube:player_client=ios" && ok=0
+                [ $ok -ne 0 ] && attempt "${YT[@]}" --extractor-args "youtube:player_client=tv" && ok=0
                 ;;
               *)
-                [ -f cookies.txt ] && cf=(--cookies cookies.txt)
+                site="tiktok"
+                attempt && ok=0
+                [ $ok -ne 0 ] && attempt --user-agent "$MOBILE_UA" && ok=0
+                [ $ok -ne 0 ] && attempt --impersonate chrome && ok=0
                 ;;
             esac
 
-            mkdir -p "t/$i"
-            echo "=== [$i] ($site) $url (cookies: ${cf[*]:-none}) ==="
-
-            # try 1: only the first 20 seconds
-            yt-dlp "${cf[@]}" "${extra[@]}" --no-playlist -f "b[height<=480]/b/best" \
-              --download-sections "*0-20" -o "t/$i/clip.%(ext)s" "$url" > "t/$i.log" 2>&1
+            echo "=== [$i] ($site) $url (cookies file: $( [ -f cookies.txt ] && echo yes || echo no )) ==="
             f=$(ls t/$i/clip.* 2>/dev/null | head -1)
-            # try 2: normal download, capped at 80 MB
-            if [ -z "$f" ] || [ ! -s "$f" ]; then
-              echo "--- retry without section cut ---" >> "t/$i.log"
-              yt-dlp "${cf[@]}" "${extra[@]}" --no-playlist -f "b[height<=480]/b/best" \
-                --max-filesize 80M -o "t/$i/clip.%(ext)s" "$url" >> "t/$i.log" 2>&1
-              f=$(ls t/$i/clip.* 2>/dev/null | head -1)
-            fi
-
-            if [ -n "$f" ] && [ -s "$f" ]; then
+            if [ $ok -eq 0 ] && [ -n "$f" ] && [ -s "$f" ]; then
               size=$(du -h "$f" | cut -f1)
               dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)
               echo "- [$i] OK ($site) - $size, ${dur}s" | tee -a "$GITHUB_STEP_SUMMARY"
             else
               echo "- [$i] FAIL ($site) - $url" | tee -a "$GITHUB_STEP_SUMMARY"
-              grep -E "ERROR|WARNING" "t/$i.log" | tail -3 | cut -c1-300 | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
+              grep -E "ERROR|Sign in|bot|login|403|blocked" "$LOG" | sort -u | tail -4 | cut -c1-300 | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
             fi
             echo "--- full log [$i] ---"
-            cat "t/$i.log"
+            cat "$LOG"
           done
