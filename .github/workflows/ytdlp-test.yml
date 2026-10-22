@@ -1,0 +1,72 @@
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Video links, one per line (TikTok / Douyin / Xiaohongshu / iQIYI / YouTube ...)"
+        required: true
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install ffmpeg + yt-dlp
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -U "yt-dlp[default,curl-cffi]"
+          yt-dlp --version
+          ffmpeg -version | head -1
+
+      - name: Test downloads (first 20s of each link)
+        env:
+          URLS: ${{ inputs.urls }}
+          COOKIES_TXT: ${{ secrets.COOKIES_TXT }}
+          DOUYIN_COOKIES: ${{ secrets.DOUYIN_COOKIES }}
+          IQIYI_COOKIES: ${{ secrets.IQIYI_COOKIES }}
+        run: |
+          mkdir -p t
+          [ -n "$COOKIES_TXT" ]    && printf '%s\n' "$COOKIES_TXT"    > cookies.txt
+          [ -n "$DOUYIN_COOKIES" ] && printf '%s\n' "$DOUYIN_COOKIES" > douyin.txt
+          [ -n "$IQIYI_COOKIES" ]  && printf '%s\n' "$IQIYI_COOKIES"  > iqiyi.txt
+
+          echo "## yt-dlp test on GitHub runner" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          i=0
+          printf '%s\n' "$URLS" | while IFS= read -r line; do
+            url=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$url" ] && continue
+            i=$((i+1))
+
+            cf=""
+            case "$url" in
+              *douyin*) [ -f douyin.txt ]  && cf="--cookies douyin.txt" ;;
+              *iqiyi*)  [ -f iqiyi.txt ]   && cf="--cookies iqiyi.txt" ;;
+              *)        [ -f cookies.txt ] && cf="--cookies cookies.txt" ;;
+            esac
+
+            mkdir -p "t/$i"
+            echo "=== [$i] $url (cookies: ${cf:-none}) ==="
+            if yt-dlp $cf --impersonate chrome --no-playlist \
+                 -f "b[height<=480]/b" \
+                 --download-sections "*0-20" \
+                 -o "t/$i/clip.%(ext)s" "$url" > "t/$i.log" 2>&1; then
+              f=$(ls t/$i/clip.* 2>/dev/null | head -1)
+              if [ -n "$f" ] && [ -s "$f" ]; then
+                size=$(du -h "$f" | cut -f1)
+                dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null)
+                echo "- [$i] OK   - $size, ${dur}s - $url" | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "- [$i] FAIL - no file produced - $url" | tee -a "$GITHUB_STEP_SUMMARY"
+                tail -3 "t/$i.log" | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
+              fi
+            else
+              echo "- [$i] FAIL - $url" | tee -a "$GITHUB_STEP_SUMMARY"
+              tail -3 "t/$i.log" | sed 's/^/      /' | tee -a "$GITHUB_STEP_SUMMARY"
+            fi
+            echo "--- full log [$i] ---"
+            cat "t/$i.log"
+          done
+
