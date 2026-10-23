@@ -1,0 +1,141 @@
+name: recap
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Direct download link of the UPLOADED video (mp4). Google Drive 'anyone with link' links also work."
+        required: true
+        type: string
+      voice:
+        description: "Narrator main voice"
+        type: choice
+        default: my-MM-ThihaNeural
+        options:
+          - my-MM-ThihaNeural
+          - my-MM-NilarNeural
+      tone:
+        description: "Voice tone"
+        type: choice
+        default: natural
+        options:
+          - natural
+          - deep
+          - soft
+          - bright
+      mode:
+        description: "recap = short highlight reel, full = whole video with narration"
+        type: choice
+        default: recap
+        options:
+          - recap
+          - full
+      job_id:
+        description: "Any short id (letters/numbers)"
+        type: string
+        default: job1
+      chat_id:
+        description: "Telegram chat id (optional, used for logo lookup only)"
+        type: string
+        default: ""
+
+jobs:
+  recap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Prepare work folders
+        run: |
+          sudo mkdir -p /media/dub/uploads /media/dub/status /media/dub/logos /media/dub/thumbnails
+          sudo chown -R "$USER":"$USER" /media/dub
+          df -h /media | tail -1
+
+      - name: Install ffmpeg + python packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          python3 -m pip install --break-system-packages -q faster-whisper silero-vad onnxruntime soundfile numpy edge-tts rich
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          ffmpeg -version | head -1
+          python3 -c "import faster_whisper, edge_tts; print('faster-whisper + edge-tts OK')"
+
+      - name: Cache whisper models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-models-v1
+
+      - name: Fetch the uploaded video
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          url="$VIDEO_URL"
+          # Google Drive share link -> direct download link
+          if printf '%s' "$url" | grep -q "drive.google.com"; then
+            id=$(printf '%s' "$url" | sed -nE 's#.*/d/([A-Za-z0-9_-]+).*#\1#p; s#.*[?&]id=([A-Za-z0-9_-]+).*#\1#p' | head -1)
+            [ -n "$id" ] && url="https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t"
+          fi
+          key=$(printf '%s' "$JOB_ID" | tr -cd 'A-Za-z0-9_-')
+          [ -z "$key" ] && key=job1
+          echo "$key" > /tmp/key
+          curl -L --fail --retry 3 --retry-delay 5 -o "/media/dub/uploads/${key}.mp4" "$url"
+          ls -lh "/media/dub/uploads/${key}.mp4"
+          if ! ffprobe -v error -show_entries format=duration -of csv=p=0 "/media/dub/uploads/${key}.mp4"; then
+            echo "ERROR: downloaded file is not a valid video (wrong link / not public?)"; exit 1
+          fi
+
+      - name: Run the recap pipeline (n8n workflow logic)
+        env:
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+          VOICE: ${{ inputs.voice }}
+          TONE: ${{ inputs.tone }}
+          MODE: ${{ inputs.mode }}
+          CHAT_ID: ${{ inputs.chat_id }}
+          OUT_DIR: ${{ github.workspace }}/out
+        run: |
+          key=$(cat /tmp/key)
+          [ -z "$GEMINI_KEY" ] && { echo "ERROR: GitHub secret GEMINI_KEY is not set"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          key = open('/tmp/key').read().strip()
+          json.dump({
+              "url": "local:" + key, "lang": "my",
+              "chatId": os.environ.get("CHAT_ID", ""),
+              "voicePref": os.environ["VOICE"], "tonePref": os.environ["TONE"],
+              "modePref": os.environ["MODE"], "job_id": key,
+          }, open("input.json", "w"))
+          PY
+          mkdir -p out
+          node run_pipeline.js workflow.json input.json
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Recap result" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f out/final.mp4 ]; then
+            echo "- final.mp4: $(du -h out/final.mp4 | cut -f1), $(ffprobe -v error -show_entries format=duration -of csv=p=0 out/final.mp4)s" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Download it from the **Artifacts** section at the bottom of this page." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- FAILED: $(cat out/error.txt 2>/dev/null || echo 'see the log')" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recap-${{ inputs.job_id }}
+          path: |
+            out/final.mp4
+            out/script.srt
+            out/voiceover.txt
+            out/error.txt
+            out/run_summary.json
+          retention-days: 3
+          if-no-files-found: ignore
